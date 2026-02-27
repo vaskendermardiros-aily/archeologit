@@ -41,6 +41,22 @@ def commit_type(message: str) -> str:
     return m.group(1).lower() if m else "other"
 
 
+COMMIT_TYPE_COLORS: dict[str, str] = {
+    "feat":     "#2ecc71",
+    "fix":      "#e74c3c",
+    "refactor": "#3498db",
+    "chore":    "#95a5a6",
+    "test":     "#9b59b6",
+    "docs":     "#f39c12",
+    "ci":       "#1abc9c",
+    "perf":     "#e67e22",
+    "build":    "#7f8c8d",
+    "style":    "#bdc3c7",
+    "revert":   "#c0392b",
+    "other":    "#95a5a6",
+}
+
+
 def _utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
@@ -358,6 +374,8 @@ with tab2:
                 fig_donut = px.pie(
                     type_counts, names="type", values="count",
                     hole=0.45,
+                    color="type",
+                    color_discrete_map=COMMIT_TYPE_COLORS,
                 )
                 fig_donut.update_traces(textposition="inside", textinfo="percent+label")
                 fig_donut.update_layout(
@@ -589,21 +607,58 @@ with tab5:
             selected_pr = pr_list[pr_list["pr_title"] == selected_title].iloc[0]
             selected_sha = selected_pr["merge_commit_sha"]
 
-            # PR metadata strip
-            mc1, mc2, mc3 = st.columns([1, 1, 4])
-            mc1.metric("PR", selected_pr["merged_branch"])
-            mc2.metric("Merged", pd.Timestamp(selected_pr["merged_at"]).strftime("%Y-%m-%d"))
-            mc3.markdown(
-                f"**{selected_pr['message'].split(chr(10))[0][:120]}**",
-                help=selected_pr["message"][:800],
+            # ── Enrich with diff stats and author ────────────────────
+            pr_diff = diffs[diffs["sha"] == selected_sha]
+            pr_ins   = int(pr_diff["insertions"].sum()) if not pr_diff.empty else None
+            pr_dels  = int(pr_diff["deletions"].sum())  if not pr_diff.empty else None
+            pr_files = int(pr_diff["files_changed"].sum()) if not pr_diff.empty else None
+
+            pr_author_row = commits[commits["short_sha"] == selected_sha]
+            pr_author = pr_author_row["author_name"].iloc[0] if not pr_author_row.empty else "—"
+
+            pr_type = commit_type(selected_pr["message"])
+            type_color = COMMIT_TYPE_COLORS.get(pr_type, "#95a5a6")
+
+            # ── Metadata row: 6 chips ─────────────────────────────────
+            mc1, mc2, mc3, mc4, mc5, mc6 = st.columns([1, 1, 1, 1, 1, 1])
+            mc1.markdown(
+                f"<div style='padding-top:6px'>"
+                f"<span style='font-size:11px;color:#888'>Type</span><br>"
+                f"<span style='color:{type_color};font-weight:bold;font-size:2rem'>{pr_type}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
             )
+            mc2.metric("PR", selected_pr["merged_branch"])
+            mc3.metric("Merged", pd.Timestamp(selected_pr["merged_at"]).strftime("%Y-%m-%d"))
+            mc4.metric("Author", pr_author)
+            if pr_ins is not None:
+                mc5.markdown(
+                    f"<div style='padding-top:6px'>"
+                    f"<span style='font-size:11px;color:#888'>Lines changed</span><br>"
+                    f"<span style='color:#2ecc71;font-weight:bold;font-size:2rem'>+{pr_ins:,}</span>"
+                    f"&nbsp;&nbsp;"
+                    f"<span style='color:#e74c3c;font-weight:bold;font-size:2rem'>−{pr_dels:,}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                mc6.metric("Files changed", f"{pr_files:,}" if pr_files else "—")
+            else:
+                mc5.metric("Lines +", "—")
+                mc6.metric("Files", "—")
+
+            # ── Full PR message ───────────────────────────────────────
+            raw_msg = selected_pr["message"].strip()
+            lines = raw_msg.split("\n")
+            title_line = lines[0]
+            body_lines = lines[1:] if len(lines) > 1 else []
+            body_text  = "\n".join(body_lines).strip()
 
             st.divider()
 
             # ── Per-PR folder changes ─────────────────────────────────
             pr_dirs = folders[folders["sha"] == selected_sha].copy()
 
-            col_sun, col_table = st.columns([3, 2])
+            col_sun, col_table, col_msg = st.columns([3, 2, 2])
 
             with col_sun:
                 st.subheader("Directories touched")
@@ -710,7 +765,6 @@ with tab5:
                     .sort_values(["change_type", "events"], ascending=[True, False])
                 )
                 summary.columns = ["Directory", "Change type", "Events"]
-                # Colour-code the change type column
                 def _style_type(val: str) -> str:
                     c = {"added": "#2ecc71", "modified": "#3498db",
                          "removed": "#e74c3c", "renamed": "#f39c12"}.get(val, "")
@@ -722,6 +776,12 @@ with tab5:
                     hide_index=True,
                     height=420,
                 )
+
+            with col_msg:
+                st.subheader("📝 PR description")
+                st.markdown(f"**{title_line}**")
+                if body_text:
+                    st.markdown(body_text)
 
             st.divider()
 
