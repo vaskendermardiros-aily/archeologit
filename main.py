@@ -103,7 +103,7 @@ def cmd_authors(args: argparse.Namespace) -> None:
 
 def cmd_folders(args: argparse.Namespace) -> None:
     repo = open_repo(args.repo)
-    changes = get_folder_changes(repo, branch=args.branch, max_count=args.max)
+    changes = get_folder_changes(repo, branch=args.branch, max_count=args.max, depth=args.folder_depth)
     if args.json or args.output:
         _emit(to_json(changes), args.output)
     else:
@@ -176,7 +176,7 @@ def cmd_all(args: argparse.Namespace) -> None:
             ba.authors = [a for a in ba.authors if a.author_name.lower() not in lowered]
     print(f"  authors       : analysed {len(authors)} branch(es)")
 
-    folders = get_folder_changes(repo, branch=branch, max_count=args.max)
+    folders = get_folder_changes(repo, branch=branch, max_count=args.max, depth=args.folder_depth)
     print(f"  folders       : {len(folders)} folder-change events")
 
     diff_stats = get_diff_stats(repo, branch=branch, max_count=args.max)
@@ -220,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--repo", default="/Users/vaskendermardiros/Repos/aily-super-agent", metavar="PATH", help="Path to the git repo (default: aily-super-agent)")
     common.add_argument("--branch", default=None, metavar="NAME", help="Branch to analyse")
     common.add_argument("--max", type=int, default=None, metavar="N", help="Cap commits per analyzer")
+    common.add_argument("--folder-depth", dest="folder_depth", type=int, default=4, metavar="N",
+                        help="Directory depth for folder structure analysis (default: 4)")
     common.add_argument(
         "--exclude-author",
         dest="exclude_authors",

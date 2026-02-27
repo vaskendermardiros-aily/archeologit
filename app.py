@@ -155,11 +155,12 @@ st.caption(f"Branch: `{branch}`  ·  Showing {start_date} → {end_date}  ·  {l
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Overview",
     "⚡ Activity",
     "👥 Contributors",
     "📁 Codebase",
+    "🗂 PR Explorer",
     "🔀 PRs & Merges",
 ])
 
@@ -220,10 +221,20 @@ with tab1:
                 on="merged_at",
                 direction="nearest",
             )
-            pr_labels = merge_locs["merged_branch"].where(
-                merge_locs["pr_number"].isna(),
-                "PR #" + merge_locs["pr_number"].astype("Int64").astype(str),
-            ) if "pr_number" in merge_locs.columns else merge_locs["merged_branch"]
+            # Build hover label: "PR #NNN — first line of message (clipped to 60 chars)"
+            pr_number_str = (
+                "PR #" + merge_locs["pr_number"].astype("Int64").astype(str)
+                if "pr_number" in merge_locs.columns
+                else merge_locs["merged_branch"]
+            )
+            pr_title = (
+                merge_locs["message"]
+                .str.split("\n").str[0]          # first line only
+                .str.replace(r"\s*\(#\d+\)\s*$", "", regex=True)  # strip trailing (#NNN)
+                .str.strip()
+                .str[:60]
+            )
+            pr_labels = pr_number_str + " — " + pr_title
 
             fig_loc.add_trace(go.Scatter(
                 x=merge_locs["merged_at"],
@@ -313,6 +324,7 @@ with tab2:
         with col_scatter:
             st.subheader("Commit size")
             if "lines_changed" in commits.columns:
+                log_scale = st.toggle("Log scale (y-axis)", value=False, key="scatter_log")
                 scatter_df = commits[["committed_at", "lines_changed", "author_name", "short_sha", "message"]].copy()
                 scatter_df["message_short"] = scatter_df["message"].str.split("\n").str[0].str[:80]
                 fig_sc = px.scatter(
@@ -320,6 +332,7 @@ with tab2:
                     x="committed_at",
                     y="lines_changed",
                     color="author_name",
+                    log_y=log_scale,
                     hover_data={"committed_at": True, "lines_changed": True,
                                 "short_sha": True, "message_short": True, "author_name": True},
                     labels={"committed_at": "Date", "lines_changed": "Lines changed",
@@ -330,6 +343,7 @@ with tab2:
                     height=360,
                     margin=dict(l=0, r=0, t=10, b=0),
                     showlegend=False,
+                    yaxis_title="Lines changed (log)" if log_scale else "Lines changed",
                 )
                 st.plotly_chart(fig_sc, use_container_width=True)
             else:
@@ -540,9 +554,265 @@ with tab4:
 
 
 # ============================================================
-# TAB 5 — PRs & MERGES
+# TAB 5 — PR EXPLORER
 # ============================================================
 with tab5:
+    if merges.empty or folders.empty:
+        st.info("Need both merge events and folder change data to use this tab.")
+    else:
+        # Build PR list for the slider: merges sorted chronologically, title clipped
+        pr_list = (
+            merges.sort_values("merged_at")
+            .assign(
+                pr_title=lambda d: (
+                    "PR #" + d["pr_number"].astype("Int64").astype(str) + "  —  "
+                    + d["message"].str.split("\n").str[0]
+                      .str.replace(r"\s*\(#\d+\)\s*$", "", regex=True)
+                      .str.strip()
+                      .str[:60]
+                )
+            )
+            .reset_index(drop=True)
+        )
+
+        if pr_list.empty:
+            st.info("No PRs in the selected date range.")
+        else:
+            # ── PR selector ──────────────────────────────────────────
+            pr_titles = pr_list["pr_title"].tolist()
+            selected_title = st.select_slider(
+                "Browse PRs (oldest → newest)",
+                options=pr_titles,
+                value=pr_titles[-1],
+                key="pr_explorer_slider",
+            )
+            selected_pr = pr_list[pr_list["pr_title"] == selected_title].iloc[0]
+            selected_sha = selected_pr["merge_commit_sha"]
+
+            # PR metadata strip
+            mc1, mc2, mc3 = st.columns([1, 1, 4])
+            mc1.metric("PR", selected_pr["merged_branch"])
+            mc2.metric("Merged", pd.Timestamp(selected_pr["merged_at"]).strftime("%Y-%m-%d"))
+            mc3.markdown(
+                f"**{selected_pr['message'].split(chr(10))[0][:120]}**",
+                help=selected_pr["message"][:800],
+            )
+
+            st.divider()
+
+            # ── Per-PR folder changes ─────────────────────────────────
+            pr_dirs = folders[folders["sha"] == selected_sha].copy()
+
+            col_sun, col_table = st.columns([3, 2])
+
+            with col_sun:
+                st.subheader("Directories touched")
+                if pr_dirs.empty:
+                    st.info("No folder-level changes recorded for this PR.")
+                else:
+                    # Build sunburst: split each path into parts and build
+                    # parent/label/value/color lists for Plotly
+                    _color_map = {
+                        "added":    "#2ecc71",
+                        "modified": "#3498db",
+                        "removed":  "#e74c3c",
+                        "renamed":  "#f39c12",
+                    }
+
+                    # Count events per (directory, change_type)
+                    dir_counts = (
+                        pr_dirs.groupby(["directory", "change_type"])
+                        .size()
+                        .reset_index(name="count")
+                    )
+
+                    # Determine dominant change_type per directory for colouring
+                    dominant = (
+                        dir_counts.sort_values("count", ascending=False)
+                        .groupby("directory")
+                        .first()
+                        .reset_index()[["directory", "change_type"]]
+                    )
+
+                    # Build sunburst node lists
+                    # Each path like "a/b/c" gives nodes: "a", "a/b", "a/b/c"
+                    # with parent "", "a", "a/b" respectively
+                    all_nodes: dict[str, dict] = {}  # path → {parent, count, change_type}
+
+                    for _, row in dir_counts.iterrows():
+                        parts = row["directory"].split("/")
+                        for depth in range(1, len(parts) + 1):
+                            node  = "/".join(parts[:depth])
+                            parent = "/".join(parts[:depth - 1]) if depth > 1 else ""
+                            if node not in all_nodes:
+                                all_nodes[node] = {"parent": parent, "count": 0, "change_type": "modified"}
+                            all_nodes[node]["count"] += row["count"]
+
+                    # Overwrite change_type with dominant for leaf nodes
+                    for _, row in dominant.iterrows():
+                        if row["directory"] in all_nodes:
+                            all_nodes[row["directory"]]["change_type"] = row["change_type"]
+
+                    # Parent nodes inherit dominant child change_type
+                    for node, info in all_nodes.items():
+                        if not any(v["parent"] == node for v in all_nodes.values()):
+                            continue  # leaf — already set
+                        child_types = [
+                            v["change_type"] for k, v in all_nodes.items()
+                            if v["parent"] == node
+                        ]
+                        if child_types:
+                            for ct in ("added", "removed", "renamed", "modified"):
+                                if ct in child_types:
+                                    all_nodes[node]["change_type"] = ct
+                                    break
+
+                    labels  = [n.split("/")[-1] or n for n in all_nodes]
+                    parents = [v["parent"] for v in all_nodes.values()]
+                    values  = [v["count"]  for v in all_nodes.values()]
+                    colors  = [_color_map.get(v["change_type"], "#95a5a6") for v in all_nodes.values()]
+                    full_paths = list(all_nodes.keys())
+
+                    fig_sun = go.Figure(go.Sunburst(
+                        labels=labels,
+                        parents=parents,
+                        values=values,
+                        ids=full_paths,
+                        marker=dict(colors=colors),
+                        hovertemplate=(
+                            "<b>%{id}</b><br>"
+                            "Events: %{value}<extra></extra>"
+                        ),
+                        branchvalues="total",
+                        maxdepth=4,
+                    ))
+                    fig_sun.update_layout(
+                        height=440,
+                        margin=dict(l=0, r=0, t=10, b=10),
+                    )
+
+                    # Legend
+                    leg_cols = st.columns(4)
+                    for i, (ct, col_hex) in enumerate(_color_map.items()):
+                        leg_cols[i].markdown(
+                            f"<span style='color:{col_hex}'>■</span> {ct.capitalize()}",
+                            unsafe_allow_html=True,
+                        )
+
+                    st.plotly_chart(fig_sun, use_container_width=True)
+
+            with col_table:
+                st.subheader("Change summary")
+                summary = (
+                    pr_dirs.groupby(["directory", "change_type"])
+                    .size()
+                    .reset_index(name="events")
+                    .sort_values(["change_type", "events"], ascending=[True, False])
+                )
+                summary.columns = ["Directory", "Change type", "Events"]
+                # Colour-code the change type column
+                def _style_type(val: str) -> str:
+                    c = {"added": "#2ecc71", "modified": "#3498db",
+                         "removed": "#e74c3c", "renamed": "#f39c12"}.get(val, "")
+                    return f"color: {c}; font-weight: bold" if c else ""
+
+                st.dataframe(
+                    summary.style.applymap(_style_type, subset=["Change type"]),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=420,
+                )
+
+            st.divider()
+
+            # ── Directory debut timeline ──────────────────────────────
+            st.subheader("Directory debut timeline — when each folder first appeared")
+            st.caption(
+                "Each marker is the PR where a directory was first seen with an 'added' event. "
+                "Sorted by first appearance."
+            )
+
+            # Find first "added" event per directory across ALL folder data (not just date-filtered)
+            # so we always show the true birth even if it's outside the current window
+            all_folders = pd.DataFrame(report.get("folder_changes", []))
+            all_folders["committed_at"] = pd.to_datetime(all_folders["committed_at"], utc=True)
+            all_merges_full = pd.DataFrame(report.get("merges", []))
+            all_merges_full["merged_at"] = pd.to_datetime(all_merges_full["merged_at"], utc=True)
+
+            first_added = (
+                all_folders[all_folders["change_type"] == "added"]
+                .sort_values("committed_at")
+                .groupby("directory")
+                .first()
+                .reset_index()[["directory", "sha", "committed_at"]]
+            )
+
+            # Attach PR info via SHA match
+            first_added = first_added.merge(
+                all_merges_full[["merge_commit_sha", "merged_branch", "pr_number", "message"]]
+                    .rename(columns={"merge_commit_sha": "sha"}),
+                on="sha",
+                how="left",
+            )
+            first_added["pr_label"] = (
+                "PR #" + first_added["pr_number"].astype("Int64").astype(str)
+            ).where(first_added["pr_number"].notna(), first_added["sha"])
+
+            first_added = first_added.sort_values("committed_at").reset_index(drop=True)
+            first_added["rank"] = range(len(first_added))
+            first_added["dir_short"] = first_added["directory"].apply(
+                lambda d: d if len(d) <= 35 else "…/" + d.split("/")[-1]
+            )
+            first_added["hover_msg"] = (
+                first_added["message"]
+                .fillna("")
+                .str.split("\n").str[0]
+                .str[:70]
+            )
+
+            # Limit to top-level depth control
+            max_depth = st.slider(
+                "Max directory depth shown", min_value=1, max_value=5, value=2,
+                key="debut_depth",
+                help="1 = top-level folders only, 2 = two levels deep, etc.",
+            )
+            first_added_f = first_added[
+                first_added["directory"].str.count("/") < max_depth
+            ]
+
+            if first_added_f.empty:
+                st.info("No 'added' events found for this depth setting.")
+            else:
+                fig_debut = go.Figure()
+                fig_debut.add_trace(go.Scatter(
+                    x=first_added_f["committed_at"],
+                    y=first_added_f["rank"],
+                    mode="markers+text",
+                    marker=dict(size=10, color="#2ecc71", symbol="circle"),
+                    text=first_added_f["dir_short"],
+                    textposition="middle right",
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>"
+                        "First seen: %{x|%Y-%m-%d}<br>"
+                        "Via: %{customdata[1]}<br>"
+                        "%{customdata[2]}<extra></extra>"
+                    ),
+                    customdata=first_added_f[["directory", "pr_label", "hover_msg"]].values,
+                ))
+                fig_debut.update_layout(
+                    height=max(350, len(first_added_f) * 22),
+                    xaxis_title="Date",
+                    yaxis=dict(visible=False),
+                    margin=dict(l=0, r=220, t=10, b=0),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_debut, use_container_width=True)
+
+
+# ============================================================
+# TAB 6 — PRs & MERGES
+# ============================================================
+with tab6:
     if merges.empty:
         st.info("No merge events in selected range.")
     else:
