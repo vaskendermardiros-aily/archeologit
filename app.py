@@ -207,13 +207,13 @@ st.caption(f"Branch: `{branch}`  ·  Showing {start_date} → {end_date}  ·  {l
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab6, tab5, tab7 = st.tabs([
     "📊 Overview",
     "⚡ Activity",
     "👥 Contributors",
     "📁 Codebase",
-    "🗂 PR Explorer",
     "🔀 PRs & Merges",
+    "🗂 PR Explorer",
     "🫧 Cast of Characters",
 ])
 
@@ -577,7 +577,7 @@ with tab4:
         # --- Directory × month heatmap ---
         with col_heat:
             st.subheader("Directory activity heatmap")
-            heat_dirs_n = st.slider("Directories in heatmap", 5, 25, 15, key="heat_n")
+            heat_dirs_n = st.slider("Directories in heatmap", 5, 50, 15, key="heat_n")
 
             top_dir_names = (
                 folders_f.groupby("directory").size()
