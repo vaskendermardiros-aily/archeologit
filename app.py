@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -59,6 +60,41 @@ COMMIT_TYPE_COLORS: dict[str, str] = {
 
 def _utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def _beeswarm_y(x_numeric: np.ndarray, radii: np.ndarray, padding: float = 0.2) -> np.ndarray:
+    """Step-based beeswarm (data-space).
+
+    x_numeric and radii are in the same units (days). Returns y positions
+    centred at 0 in those same units.
+    """
+    n = len(x_numeric)
+    y = np.zeros(n, dtype=float)
+
+    def has_overlap(i: int, trial_y: float) -> bool:
+        xi, ri = x_numeric[i], radii[i]
+        for j in range(i):
+            dist = np.sqrt((xi - x_numeric[j]) ** 2 + (trial_y - y[j]) ** 2)
+            if dist < (ri + radii[j] + padding):
+                return True
+        return False
+
+    step   = max(0.1, float(radii.max()) * 0.1)
+    y_max  = max(20.0, float(radii.max()) * n)
+
+    for i in range(n):
+        placed = False
+        for y_offset in np.arange(0, y_max, step):
+            for sign in [1, -1]:
+                trial_y = y_offset * sign
+                if not has_overlap(i, trial_y):
+                    y[i] = trial_y
+                    placed = True
+                    break
+            if placed:
+                break
+
+    return y
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +207,14 @@ st.caption(f"Branch: `{branch}`  ·  Showing {start_date} → {end_date}  ·  {l
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Overview",
     "⚡ Activity",
     "👥 Contributors",
     "📁 Codebase",
     "🗂 PR Explorer",
     "🔀 PRs & Merges",
+    "🫧 Cast of Characters",
 ])
 
 # ============================================================
@@ -967,3 +1004,188 @@ with tab6:
         pr_display["message"] = pr_display["message"].str.split("\n").str[0].str[:100]
         pr_display.columns = [c.replace("_", " ").title() for c in pr_display.columns]
         st.dataframe(pr_display, use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# TAB 7 — CAST OF CHARACTERS
+# ============================================================
+with tab7:
+    st.markdown(
+        "Each bubble is a contributor. "
+        "**Position** = when they made their first commit. "
+        "**Size** = total lines added. "
+        "**Colour** = dominant commit type."
+    )
+
+    if commits.empty:
+        st.info("No commit data in selected range.")
+    else:
+        # ── Build per-author aggregates from the date-filtered commits ──
+        bubble_commits = commits.copy()
+
+        # Attach diff stats if not already merged
+        if "insertions" not in bubble_commits.columns:
+            if not diffs.empty:
+                bubble_commits = bubble_commits.merge(
+                    diffs[["sha", "insertions", "deletions"]].rename(columns={"sha": "short_sha"}),
+                    on="short_sha", how="left",
+                )
+            else:
+                bubble_commits["insertions"] = 0
+                bubble_commits["deletions"]  = 0
+
+        bubble_commits["insertions"] = bubble_commits["insertions"].fillna(0)
+        bubble_commits["deletions"]  = bubble_commits["deletions"].fillna(0)
+
+        # Attach commit type per commit
+        if "commit_type" not in bubble_commits.columns:
+            bubble_commits["commit_type"] = bubble_commits["message"].apply(commit_type)
+
+        # Dominant commit type = the type with the most commits for that author
+        dominant_type = (
+            bubble_commits.groupby(["author_name", "commit_type"])
+            .size()
+            .reset_index(name="n")
+            .sort_values("n", ascending=False)
+            .groupby("author_name")
+            .first()
+            .reset_index()[["author_name", "commit_type"]]
+            .rename(columns={"commit_type": "dominant_type"})
+        )
+
+        author_bubbles = (
+            bubble_commits.groupby("author_name")
+            .agg(
+                first_commit=("committed_at", "min"),
+                last_commit=("committed_at", "max"),
+                commit_count=("short_sha", "count"),
+                lines_added=("insertions", "sum"),
+                lines_removed=("deletions", "sum"),
+            )
+            .assign(net_loc=lambda d: d["lines_added"] - d["lines_removed"])
+            .reset_index()
+            .merge(dominant_type, on="author_name", how="left")
+        )
+
+        # Minimum bubble size so tiny contributors are still visible
+        min_size = author_bubbles["lines_added"].clip(lower=1)
+        author_bubbles["bubble_size"] = (
+            (min_size / min_size.max()) ** 0.5 * 80 + 8
+        ).clip(upper=88)
+
+        author_bubbles["color"] = author_bubbles["dominant_type"].map(
+            lambda t: COMMIT_TYPE_COLORS.get(t, "#95a5a6")
+        )
+
+        # Tooltip text
+        author_bubbles["hover"] = (
+            "<b>" + author_bubbles["author_name"] + "</b><br>"
+            + "Dominant type: " + author_bubbles["dominant_type"].fillna("other") + "<br>"
+            + "First commit: " + author_bubbles["first_commit"].dt.strftime("%Y-%m-%d") + "<br>"
+            + "Last commit: "  + author_bubbles["last_commit"].dt.strftime("%Y-%m-%d")  + "<br>"
+            + "Commits: "      + author_bubbles["commit_count"].astype(str) + "<br>"
+            + "Lines added: +" + author_bubbles["lines_added"].apply(lambda x: f"{int(x):,}") + "<br>"
+            + "Lines removed: −" + author_bubbles["lines_removed"].apply(lambda x: f"{int(x):,}")
+        )
+
+        df_plot = author_bubbles.copy()
+
+        # x in days
+        df_plot["x_numeric"] = (
+            (df_plot["first_commit"] - df_plot["first_commit"].min())
+            .dt.total_seconds() / (60 * 60 * 24)
+        )
+
+        # Power scaling: higher exponent → bigger gap between small and large contributors
+        lines = df_plot["lines_added"].clip(lower=1)
+        lines_norm = lines / lines.max()          # [~0, 1]
+        df_plot["radius"] = lines_norm ** 0.35 * 7.0 + 0.5
+        padding = 0.2
+
+        # ── Beeswarm ──────────────────────────────────────────────────
+        y_pos = _beeswarm_y(
+            df_plot["x_numeric"].values,
+            df_plot["radius"].values,
+            padding=padding,
+        )
+        df_plot["y"] = y_pos
+
+        y_extent = float(np.abs(y_pos).max() + df_plot["radius"].max() + 1.0)
+
+        # ── Plot ──────────────────────────────────────────────────────
+        fig_bubbles = go.Figure()
+        fig_bubbles.add_trace(go.Scatter(
+            x=df_plot["first_commit"],
+            y=df_plot["y"],
+            mode="markers+text",
+            marker=dict(
+                size=df_plot["radius"] * 12,
+                color=df_plot["color"],
+                opacity=0.85,
+                line=dict(width=1, color="rgba(50,50,50,0.5)"),
+            ),
+            text=df_plot["author_name"].apply(
+                lambda n: n.split("-")[0].split(" ")[0]
+            ),
+            textposition="middle center",
+            textfont=dict(size=9, color="black"),
+            customdata=df_plot[["author_name", "commit_count", "lines_added", "lines_removed"]].values,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "First commit: %{x}<br>"
+                "Commits: %{customdata[1]}<br>"
+                "Lines added: +%{customdata[2]:,}<br>"
+                "Lines removed: −%{customdata[3]:,}"
+                "<extra></extra>"
+            ),
+        ))
+
+        fig_bubbles.update_layout(
+            title="Cast of Characters",
+            xaxis=dict(title="Timeline", showgrid=True),
+            yaxis=dict(
+                showticklabels=False,
+                showgrid=False,
+                zeroline=True,
+                zerolinecolor="black",
+                range=[-y_extent, y_extent],
+            ),
+            height=500,
+            template="plotly_white",
+            hovermode="closest",
+        )
+        st.plotly_chart(fig_bubbles, use_container_width=True)
+
+        # ── Colour legend ─────────────────────────────────────────────
+        present_types = df_plot["dominant_type"].dropna().unique()
+        leg_cols = st.columns(min(len(present_types), 6))
+        for i, t in enumerate(sorted(present_types)):
+            c = COMMIT_TYPE_COLORS.get(t, "#95a5a6")
+            leg_cols[i % len(leg_cols)].markdown(
+                f"<span style='color:{c}'>●</span> {t}",
+                unsafe_allow_html=True,
+            )
+
+        st.divider()
+
+        # ── Contributor timeline table ────────────────────────────────
+        st.subheader("Contributor details")
+        tbl = df_plot[[
+            "author_name", "dominant_type", "first_commit", "last_commit",
+            "commit_count", "lines_added", "lines_removed", "net_loc",
+        ]].copy()
+        tbl["first_commit"] = tbl["first_commit"].dt.strftime("%Y-%m-%d")
+        tbl["last_commit"]  = tbl["last_commit"].dt.strftime("%Y-%m-%d")
+        tbl.columns = ["Author", "Type", "First commit", "Last commit",
+                       "Commits", "Lines added", "Lines removed", "Net LOC"]
+        tbl = tbl.sort_values("Lines added", ascending=False).reset_index(drop=True)
+
+        def _style_dominant(val: str) -> str:
+            c = COMMIT_TYPE_COLORS.get(val, "")
+            return f"color: {c}; font-weight: bold" if c else ""
+
+        st.dataframe(
+            tbl.style.applymap(_style_dominant, subset=["Type"]),
+            use_container_width=True,
+            hide_index=True,
+        )
